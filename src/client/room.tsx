@@ -33,12 +33,13 @@ type IncomingMeta = {
   size: number;
   mime: string;
   encrypted: boolean;
-  sha256: string;
 };
 
-type DoneMessage = { type: "done" };
+type DoneMessage = { type: "done"; sha256: string };
 
-type DataMessage = IncomingMeta | DoneMessage;
+type CapabilitiesMessage = { type: "capabilities"; maxChunkSize: number };
+
+type DataMessage = IncomingMeta | DoneMessage | CapabilitiesMessage;
 
 type OutgoingMeta = IncomingMeta;
 
@@ -69,11 +70,13 @@ type OffererPeer = {
   offerInFlight: boolean;
   sending: boolean;
   sent: boolean;
+  maxChunkSize: number | null;
 };
 
 const clientId = getClientId();
 const t = getT();
-const TRANSFER_CHUNK_SIZE = 256 * 1024;
+const CLI_SAFE_CHUNK_SIZE = 16 * 1024;
+const WEB_PREFERRED_CHUNK_SIZE = 256 * 1024;
 
 const root = document.querySelector("main.container");
 const roomId = document.body.dataset.roomId;
@@ -197,7 +200,7 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
     }
   }, [resetPeerSends]);
 
-  const finalizeDownload = useCallback(async () => {
+  const finalizeDownload = useCallback(async (expectedSha256: string) => {
     const meta = incomingMetaRef.current;
     if (!meta) return;
     setStatus(t.status.generatingFile);
@@ -208,7 +211,7 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
 
     const blob = new Blob(recvChunksRef.current, { type: meta.mime });
     const actualSha256 = await sha256ArrayBuffer(await blob.arrayBuffer());
-    if (actualSha256 !== meta.sha256) {
+    if (actualSha256 !== expectedSha256) {
       setDownload(null);
       setStatus(t.status.checksumMismatch);
       return;
@@ -225,8 +228,6 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
     const dc = peer.dc;
     if (!dc) return;
 
-    setStatus(t.status.generatingFile);
-    const sha256 = await fileSha256(file);
     const encrypted = !!cryptoKeyRef.current;
     const meta: OutgoingMeta = {
       type: "meta",
@@ -234,7 +235,6 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
       size: file.size,
       mime: file.type || "application/octet-stream",
       encrypted,
-      sha256,
     };
     log("[send] starting:", meta.name, "size:", meta.size, "peer:", peer.peerId);
     dc.send(JSON.stringify(meta));
@@ -243,6 +243,7 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
     setSendProgress({ sent: 0, total: file.size });
 
     let sent = 0;
+    const negotiatedChunkSize = peer.maxChunkSize ?? CLI_SAFE_CHUNK_SIZE;
 
     dc.bufferedAmountLowThreshold = 4 * 1024 * 1024;
     const waitDrain = () =>
@@ -264,7 +265,7 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
       if (dc.bufferedAmount > 8 * 1024 * 1024) await waitDrain();
     };
 
-    const chunkSize = encrypted ? TRANSFER_CHUNK_SIZE - 12 - 16 : TRANSFER_CHUNK_SIZE;
+    const chunkSize = encrypted ? negotiatedChunkSize - 12 - 16 : negotiatedChunkSize;
     let offset = 0;
     while (offset < file.size) {
       const slice = file.slice(offset, offset + chunkSize);
@@ -275,7 +276,9 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
       offset += value.byteLength;
     }
 
-    dc.send(JSON.stringify({ type: "done" } satisfies DoneMessage));
+    setStatus(t.status.generatingFile);
+    const sha256 = await fileSha256(file);
+    dc.send(JSON.stringify({ type: "done", sha256 } satisfies DoneMessage));
     log("[send] completed, peer:", peer.peerId);
     setStatus(t.status.sendComplete);
     peer.sent = true;
@@ -292,6 +295,7 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
     if (!file) return;
     const dc = peer.dc;
     if (!dc || dc.readyState !== "open") return;
+    if (peer.maxChunkSize == null) return;
 
     log("[send] triggered:", reason, "peer:", peer.peerId);
     peer.sending = true;
@@ -334,6 +338,13 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
         ch.onerror = () => {
           console.warn("[rtc] datachannel error (peer:", peer.peerId + ")");
         };
+        ch.onmessage = (ev) => {
+          if (typeof ev.data !== "string") return;
+          const m = safeJson(ev.data) as DataMessage | null;
+          if (!m || m.type !== "capabilities") return;
+          peer.maxChunkSize = chooseChunkSize(m.maxChunkSize);
+          void trySendPeer(peer, "capabilities");
+        };
       };
 
       const createOffererPeer = (peerId: string) => {
@@ -355,6 +366,7 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
           offerInFlight: false,
           sending: false,
           sent: false,
+          maxChunkSize: null,
         };
 
         pc.onicecandidate = (ev) => {
@@ -424,6 +436,7 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
         ch.binaryType = "arraybuffer";
         ch.onopen = () => {
           log("[rtc] datachannel open (receiver)");
+          ch.send(JSON.stringify({ type: "capabilities", maxChunkSize: WEB_PREFERRED_CHUNK_SIZE } satisfies CapabilitiesMessage));
           setStatus(t.status.dataChannelReady);
         };
         ch.onclose = () => {
@@ -439,6 +452,7 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
           if (typeof ev.data === "string") {
             const m = safeJson(ev.data) as DataMessage | null;
             if (!m) return;
+            if (m.type === "capabilities") return;
 
             if (m.type === "meta") {
               log("[recv] starting:", m.name, "size:", m.size);
@@ -457,7 +471,7 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
 
             if (m.type === "done") {
               log("[recv] completed");
-              await finalizeDownload();
+              await finalizeDownload(m.sha256);
             }
             return;
           }
@@ -997,6 +1011,11 @@ function progressText(sent: number, total: number) {
   if (!total) return "0%";
   const pct = progressPercent(sent, total);
   return `${pct}% (${formatBytes(sent)} / ${formatBytes(total)})`;
+}
+
+function chooseChunkSize(receiverMax: number) {
+  if (!Number.isFinite(receiverMax) || receiverMax <= 0) return CLI_SAFE_CHUNK_SIZE;
+  return Math.max(CLI_SAFE_CHUNK_SIZE, Math.min(WEB_PREFERRED_CHUNK_SIZE, Math.floor(receiverMax)));
 }
 
 async function copyText(s: string) {

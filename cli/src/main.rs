@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use url::form_urlencoded;
@@ -41,7 +41,8 @@ use webrtc::peer_connection::RTCPeerConnection;
 const AES_KEY_LEN: usize = 32;
 const AES_NONCE_LEN: usize = 12;
 const AES_TAG_LEN: usize = 16;
-const MAX_FRAME_SIZE: usize = 256 * 1024;
+const CLI_SAFE_CHUNK_SIZE: usize = 16 * 1024;
+const PREFERRED_CHUNK_SIZE: usize = 256 * 1024;
 
 // Design: see README.md and docs/signaling-protocol.md; related to Command and transfer helpers below.
 #[derive(Parser, Debug)]
@@ -83,6 +84,8 @@ enum Command {
     key: Option<String>,
     #[arg(long, help = "Keep running after a successful receive")]
     stay_open: bool,
+    #[arg(long, help = "Print detailed receive diagnostics")]
+    debug: bool,
   },
 }
 
@@ -129,10 +132,14 @@ enum DataMessage {
     size: u64,
     mime: String,
     encrypted: bool,
-    sha256: String,
   },
   #[serde(rename = "done")]
-  Done,
+  Done { sha256: String },
+  #[serde(rename = "capabilities")]
+  Capabilities {
+    #[serde(rename = "maxChunkSize")]
+    max_chunk_size: usize,
+  },
 }
 
 struct RoomInput {
@@ -147,7 +154,6 @@ struct FileInfo {
   name: String,
   size: u64,
   mime: String,
-  sha256: String,
 }
 
 struct OffererPeerState {
@@ -186,6 +192,9 @@ struct ReceiveProgress {
   expected_sha256: Option<String>,
   hasher: Option<Sha256>,
   received: u64,
+  next_progress_percent: u64,
+  saw_first_chunk: bool,
+  debug: bool,
   encrypted: bool,
   crypto: Option<Arc<Aes256Gcm>>,
   success_tx: Option<mpsc::UnboundedSender<bool>>,
@@ -218,11 +227,12 @@ async fn main() -> Result<()> {
       endpoint,
       key,
       stay_open,
+      debug,
     } => {
       let room_input = room_id
         .or(room_input)
         .ok_or_else(|| anyhow!("Room ID or URL is required (usage: receive <ROOM_ID_OR_URL>)"))?;
-      run_receive(&room_input, &output_dir, endpoint.as_deref(), key.as_deref(), stay_open).await
+      run_receive(&room_input, &output_dir, endpoint.as_deref(), key.as_deref(), stay_open, debug).await
     }
   }
 }
@@ -378,6 +388,7 @@ async fn run_receive(
   endpoint: Option<&str>,
   key: Option<&str>,
   stay_open: bool,
+  debug: bool,
 ) -> Result<()> {
   let parsed = parse_room_input(room_input)?;
   let mut key_override = parsed.key;
@@ -422,6 +433,9 @@ async fn run_receive(
     expected_sha256: None,
     hasher: None,
     received: 0,
+    next_progress_percent: 10,
+    saw_first_chunk: false,
+    debug,
     encrypted: false,
     crypto,
     success_tx,
@@ -479,6 +493,7 @@ async fn run_receive(
               pc.on_data_channel(Box::new(move |dc| {
                 let rx_progress = rx_progress.clone();
                 Box::pin(async move {
+                  debug_log(&rx_progress, "[rtc] datachannel", "open").await;
                   wire_receiver_channel(dc, rx_progress).await;
                 })
               }));
@@ -606,6 +621,23 @@ async fn create_offerer_peer(
   let dc_for_open = dc.clone();
   let crypto = crypto.clone();
   let success_tx = success_tx.clone();
+  let (capability_tx, capability_rx) = mpsc::unbounded_channel::<usize>();
+  let capability_rx = Arc::new(Mutex::new(capability_rx));
+  dc.on_message(Box::new(move |msg: DataChannelMessage| {
+    let capability_tx = capability_tx.clone();
+    Box::pin(async move {
+      if !msg.is_string {
+        return;
+      }
+      let text = match String::from_utf8(msg.data.to_vec()) {
+        Ok(text) => text,
+        Err(_) => return,
+      };
+      if let Ok(DataMessage::Capabilities { max_chunk_size }) = serde_json::from_str::<DataMessage>(&text) {
+        let _ = capability_tx.send(max_chunk_size);
+      }
+    })
+  }));
   dc.on_open(Box::new(move || {
     let send_tx = send_tx.clone();
     let send_peer_id = send_peer_id.clone();
@@ -614,6 +646,7 @@ async fn create_offerer_peer(
     let send_state = send_state.clone();
     let crypto = crypto.clone();
     let success_tx = success_tx.clone();
+    let capability_rx = capability_rx.clone();
     Box::pin(async move {
       let mut guard = send_state.lock().await;
       if guard.sending {
@@ -622,7 +655,16 @@ async fn create_offerer_peer(
       guard.sending = true;
       drop(guard);
 
-      if let Err(err) = send_file(&dc, &file_info, crypto).await {
+      let receiver_max = timeout(Duration::from_secs(2), async {
+        capability_rx.lock().await.recv().await
+      })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(CLI_SAFE_CHUNK_SIZE);
+      let chunk_size = choose_chunk_size(receiver_max);
+
+      if let Err(err) = send_file(&dc, &file_info, crypto, chunk_size).await {
         log_line("[send] error", &format!("{err:#}"));
         return;
       }
@@ -734,6 +776,17 @@ async fn flush_receiver_candidates(state: &mut ReceiverState) -> Result<()> {
 }
 
 async fn wire_receiver_channel(dc: Arc<RTCDataChannel>, progress: Arc<Mutex<ReceiveProgress>>) {
+  let dc_for_open = dc.clone();
+  dc.on_open(Box::new(move || {
+    let dc = dc_for_open.clone();
+    Box::pin(async move {
+      let _ = send_capabilities(&dc).await;
+    })
+  }));
+  if dc.ready_state() == RTCDataChannelState::Open {
+    let _ = send_capabilities(&dc).await;
+  }
+
   dc.on_message(Box::new(move |msg: DataChannelMessage| {
     let progress = progress.clone();
     Box::pin(async move {
@@ -741,7 +794,7 @@ async fn wire_receiver_channel(dc: Arc<RTCDataChannel>, progress: Arc<Mutex<Rece
         if let Ok(text) = String::from_utf8(msg.data.to_vec()) {
           if let Ok(parsed) = serde_json::from_str::<DataMessage>(&text) {
             match parsed {
-              DataMessage::Meta { name, size, mime, encrypted, sha256 } => {
+              DataMessage::Meta { name, size, mime, encrypted } => {
                 let mut guard = progress.lock().await;
                 if encrypted && guard.crypto.is_none() {
                   log_line("[recv] error", "encrypted files need a decryption key");
@@ -758,9 +811,11 @@ async fn wire_receiver_channel(dc: Arc<RTCDataChannel>, progress: Arc<Mutex<Rece
                     guard.final_file = Some(final_path);
                     guard.file = Some(file);
                     guard.expected_size = size;
-                    guard.expected_sha256 = Some(sha256);
+                    guard.expected_sha256 = None;
                     guard.hasher = Some(Sha256::new());
                     guard.received = 0;
+                    guard.next_progress_percent = 10;
+                    guard.saw_first_chunk = false;
                     log_line("[recv] meta", &format!("{safe_name} ({mime}, {size} bytes)"));
                   }
                   Err(err) => {
@@ -769,10 +824,13 @@ async fn wire_receiver_channel(dc: Arc<RTCDataChannel>, progress: Arc<Mutex<Rece
                   }
                 }
               }
-              DataMessage::Done => {
+              DataMessage::Done { sha256 } => {
                 let mut guard = progress.lock().await;
+                debug_log_locked(&guard, "[recv] done", "checksum received");
+                guard.expected_sha256 = Some(sha256);
                 finalize_receive(&mut guard).await;
               }
+              DataMessage::Capabilities { .. } => {}
             }
           }
         }
@@ -811,13 +869,15 @@ async fn wire_receiver_channel(dc: Arc<RTCDataChannel>, progress: Arc<Mutex<Rece
       if let Some(file) = guard.file.as_mut() {
         let write_result = file.write_all(&payload).await;
         if write_result.is_ok() {
+          if !guard.saw_first_chunk {
+            guard.saw_first_chunk = true;
+            debug_log_locked(&guard, "[recv] first-chunk", &format!("{} bytes", payload.len()));
+          }
           guard.received += payload.len() as u64;
           if let Some(hasher) = guard.hasher.as_mut() {
             hasher.update(&payload);
           }
-          if guard.expected_size > 0 && guard.received >= guard.expected_size {
-            finalize_receive(&mut guard).await;
-          }
+          log_receive_progress(&mut guard);
         } else if let Err(err) = write_result {
           log_line("[recv] error", &format!("{err:#}"));
           notify_receive_done(&mut guard, false);
@@ -827,7 +887,21 @@ async fn wire_receiver_channel(dc: Arc<RTCDataChannel>, progress: Arc<Mutex<Rece
   }));
 }
 
-async fn send_file(dc: &RTCDataChannel, info: &FileInfo, crypto: Option<Arc<Aes256Gcm>>) -> Result<()> {
+async fn send_capabilities(dc: &RTCDataChannel) -> Result<()> {
+  let capabilities = serde_json::json!({
+    "type": "capabilities",
+    "maxChunkSize": CLI_SAFE_CHUNK_SIZE,
+  });
+  dc.send_text(capabilities.to_string()).await?;
+  Ok(())
+}
+
+async fn send_file(
+  dc: &RTCDataChannel,
+  info: &FileInfo,
+  crypto: Option<Arc<Aes256Gcm>>,
+  max_frame_size: usize,
+) -> Result<()> {
   let encrypted = crypto.is_some();
   let meta = serde_json::json!({
     "type": "meta",
@@ -835,23 +909,24 @@ async fn send_file(dc: &RTCDataChannel, info: &FileInfo, crypto: Option<Arc<Aes2
     "size": info.size,
     "mime": info.mime,
     "encrypted": encrypted,
-    "sha256": info.sha256,
   });
   let meta_text = serde_json::to_string(&meta)?;
   dc.send_text(meta_text).await?;
 
   let chunk_size = if encrypted {
-    MAX_FRAME_SIZE - AES_NONCE_LEN - AES_TAG_LEN
+    max_frame_size - AES_NONCE_LEN - AES_TAG_LEN
   } else {
-    MAX_FRAME_SIZE
+    max_frame_size
   };
   let mut file = File::open(&info.path).await?;
+  let mut hasher = Sha256::new();
   let mut buffer = vec![0u8; chunk_size];
   loop {
     let read = file.read(&mut buffer).await?;
     if read == 0 {
       break;
     }
+    hasher.update(&buffer[..read]);
     let payload = if let Some(crypto) = crypto.as_ref() {
       Bytes::from(encrypt_frame(crypto, &buffer[..read])?)
     } else {
@@ -860,7 +935,9 @@ async fn send_file(dc: &RTCDataChannel, info: &FileInfo, crypto: Option<Arc<Aes2
     dc.send(&payload).await?;
   }
 
-  dc.send_text("{\"type\":\"done\"}").await?;
+  let sha256 = bytes_to_hex(&hasher.finalize());
+  let done = serde_json::json!({ "type": "done", "sha256": sha256 });
+  dc.send_text(serde_json::to_string(&done)?).await?;
   wait_for_drain(dc).await;
   Ok(())
 }
@@ -877,28 +954,12 @@ async fn load_file_info(path: &Path) -> Result<FileInfo> {
     .first_or_octet_stream()
     .essence_str()
     .to_string();
-  let sha256 = file_sha256(path).await?;
   Ok(FileInfo {
     path: path.to_path_buf(),
     name,
     size,
     mime,
-    sha256,
   })
-}
-
-async fn file_sha256(path: &Path) -> Result<String> {
-  let mut file = File::open(path).await?;
-  let mut hasher = Sha256::new();
-  let mut buffer = vec![0u8; MAX_FRAME_SIZE];
-  loop {
-    let read = file.read(&mut buffer).await?;
-    if read == 0 {
-      break;
-    }
-    hasher.update(&buffer[..read]);
-  }
-  Ok(bytes_to_hex(&hasher.finalize()))
 }
 
 async fn finalize_receive(progress: &mut ReceiveProgress) {
@@ -925,7 +986,14 @@ async fn finalize_receive(progress: &mut ReceiveProgress) {
       return;
     }
   };
-  let expected_sha256 = progress.expected_sha256.take().unwrap_or_default();
+  let expected_sha256 = match progress.expected_sha256.take() {
+    Some(sha256) => sha256,
+    None => {
+      log_line("[recv] error", "checksum missing");
+      notify_receive_done(progress, false);
+      return;
+    }
+  };
   if actual_sha256 != expected_sha256 {
     log_line("[recv] error", "sha256 mismatch; keeping partial file");
     notify_receive_done(progress, false);
@@ -953,6 +1021,41 @@ async fn finalize_receive(progress: &mut ReceiveProgress) {
 fn notify_receive_done(progress: &mut ReceiveProgress, ok: bool) {
   if let Some(tx) = progress.success_tx.take() {
     let _ = tx.send(ok);
+  }
+}
+
+fn choose_chunk_size(receiver_max: usize) -> usize {
+  receiver_max.clamp(CLI_SAFE_CHUNK_SIZE, PREFERRED_CHUNK_SIZE)
+}
+
+async fn debug_log(progress: &Arc<Mutex<ReceiveProgress>>, label: &str, value: &str) {
+  let guard = progress.lock().await;
+  debug_log_locked(&guard, label, value);
+}
+
+fn debug_log_locked(progress: &ReceiveProgress, label: &str, value: &str) {
+  if progress.debug {
+    log_line(label, value);
+  }
+}
+
+fn log_receive_progress(progress: &mut ReceiveProgress) {
+  if !progress.debug {
+    return;
+  }
+  if progress.expected_size == 0 {
+    return;
+  }
+  let percent = progress.received.saturating_mul(100) / progress.expected_size;
+  while progress.next_progress_percent <= 100 && percent >= progress.next_progress_percent {
+    log_line(
+      "[recv] progress",
+      &format!(
+        "{}% ({} / {} bytes)",
+        progress.next_progress_percent, progress.received, progress.expected_size
+      ),
+    );
+    progress.next_progress_percent += 10;
   }
 }
 

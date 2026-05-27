@@ -213,13 +213,15 @@ Once WebRTC connection is established:
 ```
 Sender                                    Receiver
    │                                          │
-   │──── { type: "meta", name, size, sha256, ... } ──►│
+   │◄─── { type: "capabilities", maxChunkSize } ─│
+   │                                          │
+   │──── { type: "meta", name, size, ... } ──►│
    │                                          │
    │──── [binary chunk 1] ───────────────────►│
    │──── [binary chunk 2] ───────────────────►│
    │──── ...                                  │
    │                                          │
-   │──── { type: "done" } ───────────────────►│
+   │──── { type: "done", sha256 } ───────────►│
 ```
 
 #### Metadata Message
@@ -230,12 +232,31 @@ Sender                                    Receiver
   name: string,        // File name
   size: number,        // File size in bytes
   mime: string,        // MIME type
-  encrypted: boolean,  // Whether chunks are encrypted
+  encrypted: boolean   // Whether chunks are encrypted
+}
+```
+
+#### Capabilities Message
+
+```typescript
+{
+  type: "capabilities",
+  maxChunkSize: number // Maximum binary message size this receiver accepts
+}
+```
+
+Receivers send capabilities when the DataChannel opens. Senders choose the transfer chunk size from the receiver limit and their own preferred maximum. CLI receivers using the normal webrtc-rs `on_message` API advertise 16 KiB; browser receivers advertise a larger browser-friendly limit.
+
+#### Completion Message
+
+```typescript
+{
+  type: "done",
   sha256: string       // SHA-256 of the original plaintext file bytes
 }
 ```
 
-Receivers verify the reconstructed plaintext bytes against `sha256` before presenting the transfer as complete. CLI receivers write to a `.partial` file and rename it only after verification succeeds.
+Receivers verify the reconstructed plaintext bytes against the completion `sha256` before presenting the transfer as complete. CLI receivers write to a `.partial` file and rename it only after verification succeeds.
 
 ### End-to-End Encryption (Optional)
 
