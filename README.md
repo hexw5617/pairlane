@@ -10,7 +10,7 @@ A P2P file sharing tool using WebRTC. Transfer files directly between browsers w
 
 - **P2P Transfer**: Files are sent directly between browsers, not through a server
 - **E2E Encryption (Optional)**: AES-GCM encryption with key in URL fragment (`#k=...`), never sent to server
-- **Large File Friendly**: Uses larger transfer chunks and verifies SHA-256 before marking a download complete
+- **Large File Friendly**: Negotiates safe transfer chunks and verifies SHA-256 before marking a download complete
 - **Serverless**: Runs on Cloudflare Workers + Durable Objects, no file storage on server
 - **Multiple Receivers**: One sender can transfer to multiple receivers simultaneously (configurable concurrency)
 - **Drag & Drop**: File selection UI supports drag and drop
