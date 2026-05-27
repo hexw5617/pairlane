@@ -89,6 +89,7 @@
     "queued": "順番待ち中...",
     "preparing": "接続準備中...",
     "missingKey": "暗号化リンクが不完全です（URLの#以降が必要）",
+    "checksumMismatch": "転送されたファイルが破損しています。もう一度お試しください。",
     "receiving": "受信中: {name}",
     "disconnected": "切断されました"
   },

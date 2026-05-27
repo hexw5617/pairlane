@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use getrandom::getrandom;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -40,7 +41,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 const AES_KEY_LEN: usize = 32;
 const AES_NONCE_LEN: usize = 12;
 const AES_TAG_LEN: usize = 16;
-const MAX_FRAME_SIZE: usize = 16 * 1024;
+const MAX_FRAME_SIZE: usize = 256 * 1024;
 
 // Design: see README.md and docs/signaling-protocol.md; related to Command and transfer helpers below.
 #[derive(Parser, Debug)]
@@ -128,6 +129,7 @@ enum DataMessage {
     size: u64,
     mime: String,
     encrypted: bool,
+    sha256: String,
   },
   #[serde(rename = "done")]
   Done,
@@ -145,6 +147,7 @@ struct FileInfo {
   name: String,
   size: u64,
   mime: String,
+  sha256: String,
 }
 
 struct OffererPeerState {
@@ -177,12 +180,15 @@ struct ReceiverState {
 struct ReceiveProgress {
   output_dir: PathBuf,
   current_file: Option<PathBuf>,
+  final_file: Option<PathBuf>,
   file: Option<File>,
   expected_size: u64,
+  expected_sha256: Option<String>,
+  hasher: Option<Sha256>,
   received: u64,
   encrypted: bool,
   crypto: Option<Arc<Aes256Gcm>>,
-  success_tx: Option<mpsc::UnboundedSender<()>>,
+  success_tx: Option<mpsc::UnboundedSender<bool>>,
 }
 
 #[tokio::main]
@@ -395,7 +401,7 @@ async fn run_receive(
   let (mut ws_write, mut ws_read) = ws_stream.split();
 
   let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<ClientMessage>();
-  let (success_tx, mut success_rx) = mpsc::unbounded_channel::<()>();
+  let (success_tx, mut success_rx) = mpsc::unbounded_channel::<bool>();
   let success_tx = if stay_open { None } else { Some(success_tx) };
 
   let writer = tokio::spawn(async move {
@@ -410,15 +416,18 @@ async fn run_receive(
   let progress = Arc::new(Mutex::new(ReceiveProgress {
     output_dir: output_dir.to_path_buf(),
     current_file: None,
+    final_file: None,
     file: None,
     expected_size: 0,
+    expected_sha256: None,
+    hasher: None,
     received: 0,
     encrypted: false,
     crypto,
     success_tx,
   }));
 
-  let mut completed = false;
+  let mut completed = None;
   loop {
     tokio::select! {
       msg = ws_read.next() => {
@@ -507,18 +516,26 @@ async fn run_receive(
           }
         }
       }
-      _ = success_rx.recv(), if !stay_open => {
-        log_line("[recv] completed", "transfer done");
+      result = success_rx.recv(), if !stay_open => {
+        let ok = result.unwrap_or(false);
+        if ok {
+          log_line("[recv] completed", "transfer done");
+        } else {
+          log_line("[recv] error", "receive failed");
+        }
         if let Some(state) = receiver_state.lock().await.take() {
           let _ = state.pc.close().await;
         }
-        completed = true;
+        completed = Some(ok);
         break;
       }
     }
   }
-  if completed {
+  if let Some(ok) = completed {
     writer.abort();
+    if !ok {
+      return Err(anyhow!("receive failed"));
+    }
     return Ok(());
   }
   drop(signal_tx);
@@ -724,38 +741,37 @@ async fn wire_receiver_channel(dc: Arc<RTCDataChannel>, progress: Arc<Mutex<Rece
         if let Ok(text) = String::from_utf8(msg.data.to_vec()) {
           if let Ok(parsed) = serde_json::from_str::<DataMessage>(&text) {
             match parsed {
-              DataMessage::Meta { name, size, mime, encrypted } => {
+              DataMessage::Meta { name, size, mime, encrypted, sha256 } => {
                 let mut guard = progress.lock().await;
                 if encrypted && guard.crypto.is_none() {
                   log_line("[recv] error", "encrypted files need a decryption key");
+                  notify_receive_done(&mut guard, false);
                   return;
                 }
                 guard.encrypted = encrypted;
                 let safe_name = sanitize_file_name(&name);
-                let path = guard.output_dir.join(&safe_name);
+                let final_path = guard.output_dir.join(&safe_name);
+                let path = guard.output_dir.join(format!("{safe_name}.partial"));
                 match File::create(&path).await {
                   Ok(file) => {
                     guard.current_file = Some(path);
+                    guard.final_file = Some(final_path);
                     guard.file = Some(file);
                     guard.expected_size = size;
+                    guard.expected_sha256 = Some(sha256);
+                    guard.hasher = Some(Sha256::new());
                     guard.received = 0;
                     log_line("[recv] meta", &format!("{safe_name} ({mime}, {size} bytes)"));
                   }
                   Err(err) => {
                     log_line("[recv] error", &format!("{err:#}"));
+                    notify_receive_done(&mut guard, false);
                   }
                 }
               }
               DataMessage::Done => {
                 let mut guard = progress.lock().await;
-                guard.file = None;
-                guard.encrypted = false;
-                if let Some(tx) = guard.success_tx.take() {
-                  let _ = tx.send(());
-                }
-                if let Some(path) = guard.current_file.take() {
-                  log_line("[recv] completed", &path.display().to_string());
-                }
+                finalize_receive(&mut guard).await;
               }
             }
           }
@@ -773,6 +789,8 @@ async fn wire_receiver_channel(dc: Arc<RTCDataChannel>, progress: Arc<Mutex<Rece
           Some(crypto) => crypto,
           None => {
             log_line("[recv] error", "encrypted chunk received without key");
+            let mut guard = progress.lock().await;
+            notify_receive_done(&mut guard, false);
             return;
           }
         };
@@ -780,6 +798,8 @@ async fn wire_receiver_channel(dc: Arc<RTCDataChannel>, progress: Arc<Mutex<Rece
           Ok(plain) => plain,
           Err(err) => {
             log_line("[recv] error", &format!("{err:#}"));
+            let mut guard = progress.lock().await;
+            notify_receive_done(&mut guard, false);
             return;
           }
         }
@@ -789,18 +809,18 @@ async fn wire_receiver_channel(dc: Arc<RTCDataChannel>, progress: Arc<Mutex<Rece
 
       let mut guard = progress.lock().await;
       if let Some(file) = guard.file.as_mut() {
-        if file.write_all(&payload).await.is_ok() {
+        let write_result = file.write_all(&payload).await;
+        if write_result.is_ok() {
           guard.received += payload.len() as u64;
-          if guard.expected_size > 0 && guard.received >= guard.expected_size {
-            guard.file = None;
-            guard.encrypted = false;
-            if let Some(tx) = guard.success_tx.take() {
-              let _ = tx.send(());
-            }
-            if let Some(path) = guard.current_file.take() {
-              log_line("[recv] completed", &path.display().to_string());
-            }
+          if let Some(hasher) = guard.hasher.as_mut() {
+            hasher.update(&payload);
           }
+          if guard.expected_size > 0 && guard.received >= guard.expected_size {
+            finalize_receive(&mut guard).await;
+          }
+        } else if let Err(err) = write_result {
+          log_line("[recv] error", &format!("{err:#}"));
+          notify_receive_done(&mut guard, false);
         }
       }
     })
@@ -815,6 +835,7 @@ async fn send_file(dc: &RTCDataChannel, info: &FileInfo, crypto: Option<Arc<Aes2
     "size": info.size,
     "mime": info.mime,
     "encrypted": encrypted,
+    "sha256": info.sha256,
   });
   let meta_text = serde_json::to_string(&meta)?;
   dc.send_text(meta_text).await?;
@@ -856,12 +877,83 @@ async fn load_file_info(path: &Path) -> Result<FileInfo> {
     .first_or_octet_stream()
     .essence_str()
     .to_string();
+  let sha256 = file_sha256(path).await?;
   Ok(FileInfo {
     path: path.to_path_buf(),
     name,
     size,
     mime,
+    sha256,
   })
+}
+
+async fn file_sha256(path: &Path) -> Result<String> {
+  let mut file = File::open(path).await?;
+  let mut hasher = Sha256::new();
+  let mut buffer = vec![0u8; MAX_FRAME_SIZE];
+  loop {
+    let read = file.read(&mut buffer).await?;
+    if read == 0 {
+      break;
+    }
+    hasher.update(&buffer[..read]);
+  }
+  Ok(bytes_to_hex(&hasher.finalize()))
+}
+
+async fn finalize_receive(progress: &mut ReceiveProgress) {
+  if progress.file.is_none() {
+    return;
+  }
+  progress.file = None;
+  progress.encrypted = false;
+
+  if progress.received != progress.expected_size {
+    log_line(
+      "[recv] error",
+      &format!("size mismatch: got {} bytes, expected {} bytes", progress.received, progress.expected_size),
+    );
+    notify_receive_done(progress, false);
+    return;
+  }
+
+  let actual_sha256 = match progress.hasher.take() {
+    Some(hasher) => bytes_to_hex(&hasher.finalize()),
+    None => {
+      log_line("[recv] error", "checksum state missing");
+      notify_receive_done(progress, false);
+      return;
+    }
+  };
+  let expected_sha256 = progress.expected_sha256.take().unwrap_or_default();
+  if actual_sha256 != expected_sha256 {
+    log_line("[recv] error", "sha256 mismatch; keeping partial file");
+    notify_receive_done(progress, false);
+    return;
+  }
+
+  let partial_path = match progress.current_file.take() {
+    Some(path) => path,
+    None => return,
+  };
+  let final_path = match progress.final_file.take() {
+    Some(path) => path,
+    None => return,
+  };
+  if let Err(err) = tokio::fs::rename(&partial_path, &final_path).await {
+    log_line("[recv] error", &format!("{err:#}"));
+    notify_receive_done(progress, false);
+    return;
+  }
+
+  notify_receive_done(progress, true);
+  log_line("[recv] completed", &final_path.display().to_string());
+}
+
+fn notify_receive_done(progress: &mut ReceiveProgress, ok: bool) {
+  if let Some(tx) = progress.success_tx.take() {
+    let _ = tx.send(ok);
+  }
 }
 
 async fn create_peer_connection() -> Result<Arc<RTCPeerConnection>> {
@@ -976,6 +1068,10 @@ fn b64url_encode(value: &[u8]) -> String {
 
 fn b64url_decode(value: &str) -> Result<Vec<u8>> {
   URL_SAFE_NO_PAD.decode(value).map_err(|err| anyhow!(err))
+}
+
+fn bytes_to_hex(value: &[u8]) -> String {
+  value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn sanitize_file_name(name: &str) -> String {

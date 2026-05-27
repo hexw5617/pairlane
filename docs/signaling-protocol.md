@@ -213,7 +213,7 @@ Once WebRTC connection is established:
 ```
 Sender                                    Receiver
    │                                          │
-   │──── { type: "meta", name, size, ... } ──►│
+   │──── { type: "meta", name, size, sha256, ... } ──►│
    │                                          │
    │──── [binary chunk 1] ───────────────────►│
    │──── [binary chunk 2] ───────────────────►│
@@ -230,9 +230,12 @@ Sender                                    Receiver
   name: string,        // File name
   size: number,        // File size in bytes
   mime: string,        // MIME type
-  encrypted: boolean   // Whether chunks are encrypted
+  encrypted: boolean,  // Whether chunks are encrypted
+  sha256: string       // SHA-256 of the original plaintext file bytes
 }
 ```
+
+Receivers verify the reconstructed plaintext bytes against `sha256` before presenting the transfer as complete. CLI receivers write to a `.partial` file and rename it only after verification succeeds.
 
 ### End-to-End Encryption (Optional)
 

@@ -33,6 +33,7 @@ type IncomingMeta = {
   size: number;
   mime: string;
   encrypted: boolean;
+  sha256: string;
 };
 
 type DoneMessage = { type: "done" };
@@ -72,6 +73,7 @@ type OffererPeer = {
 
 const clientId = getClientId();
 const t = getT();
+const TRANSFER_CHUNK_SIZE = 256 * 1024;
 
 const root = document.querySelector("main.container");
 const roomId = document.body.dataset.roomId;
@@ -205,6 +207,13 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
     }
 
     const blob = new Blob(recvChunksRef.current, { type: meta.mime });
+    const actualSha256 = await sha256ArrayBuffer(await blob.arrayBuffer());
+    if (actualSha256 !== meta.sha256) {
+      setDownload(null);
+      setStatus(t.status.checksumMismatch);
+      return;
+    }
+
     const url = URL.createObjectURL(blob);
     downloadUrlRef.current = url;
 
@@ -216,6 +225,8 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
     const dc = peer.dc;
     if (!dc) return;
 
+    setStatus(t.status.generatingFile);
+    const sha256 = await fileSha256(file);
     const encrypted = !!cryptoKeyRef.current;
     const meta: OutgoingMeta = {
       type: "meta",
@@ -223,6 +234,7 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
       size: file.size,
       mime: file.type || "application/octet-stream",
       encrypted,
+      sha256,
     };
     log("[send] starting:", meta.name, "size:", meta.size, "peer:", peer.peerId);
     dc.send(JSON.stringify(meta));
@@ -252,7 +264,7 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
       if (dc.bufferedAmount > 8 * 1024 * 1024) await waitDrain();
     };
 
-    const chunkSize = 16 * 1024;
+    const chunkSize = encrypted ? TRANSFER_CHUNK_SIZE - 12 - 16 : TRANSFER_CHUNK_SIZE;
     let offset = 0;
     while (offset < file.size) {
       const slice = file.slice(offset, offset + chunkSize);
@@ -1023,6 +1035,18 @@ function getClientId() {
 async function toArrayBuffer(data: BufferLike) {
   if (data instanceof ArrayBuffer) return data;
   return data.arrayBuffer();
+}
+
+async function fileSha256(file: File) {
+  return sha256ArrayBuffer(await file.arrayBuffer());
+}
+
+async function sha256ArrayBuffer(value: ArrayBuffer) {
+  return bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", value)));
+}
+
+function bytesToHex(value: Uint8Array) {
+  return Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 /** ---------- crypto (optional E2E) ---------- */

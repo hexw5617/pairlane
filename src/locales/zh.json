@@ -89,6 +89,7 @@
     "queued": "排队中...",
     "preparing": "准备连接中...",
     "missingKey": "链接不完整（需要URL中#后的部分）",
+    "checksumMismatch": "传输的文件已损坏，请重试。",
     "receiving": "接收中: {name}",
     "disconnected": "已断开"
   },
