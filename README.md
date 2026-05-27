@@ -10,6 +10,7 @@ A P2P file sharing tool using WebRTC. Transfer files directly between browsers w
 
 - **P2P Transfer**: Files are sent directly between browsers, not through a server
 - **E2E Encryption (Optional)**: AES-GCM encryption with key in URL fragment (`#k=...`), never sent to server
+- **Large File Friendly**: Uses larger transfer chunks and verifies SHA-256 before marking a download complete
 - **Serverless**: Runs on Cloudflare Workers + Durable Objects, no file storage on server
 - **Multiple Receivers**: One sender can transfer to multiple receivers simultaneously (configurable concurrency)
 - **Drag & Drop**: File selection UI supports drag and drop
@@ -33,6 +34,8 @@ A P2P file sharing tool using WebRTC. Transfer files directly between browsers w
 ## CLI
 
 Send and receive files directly from your terminal. Works with browsers and other terminals.
+
+Transfers include a SHA-256 checksum. Receivers only mark the file complete after the downloaded bytes match the sender's checksum.
 
 ### Quick Start
 

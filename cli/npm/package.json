@@ -1,6 +1,6 @@
 {
   "name": "pairlane",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "P2P file transfer CLI for Pairlane",
   "license": "MIT",
   "repository": {

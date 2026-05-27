@@ -89,6 +89,7 @@
     "queued": "In queue...",
     "preparing": "Preparing connection...",
     "missingKey": "Incomplete link (URL fragment after # is required)",
+    "checksumMismatch": "Transfer corrupted. Please try again.",
     "receiving": "Receiving: {name}",
     "disconnected": "Disconnected"
   },

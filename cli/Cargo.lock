@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "pairlane-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1299,6 +1299,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite",
  "url",
