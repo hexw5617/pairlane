@@ -448,7 +448,7 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
           setStatus(t.status.dataChannelError);
         };
 
-        ch.onmessage = async (ev) => {
+        const handleMessage = async (ev: MessageEvent) => {
           if (typeof ev.data === "string") {
             const m = safeJson(ev.data) as DataMessage | null;
             if (!m) return;
@@ -486,6 +486,21 @@ function RoomApp({ roomId, maxConcurrent }: RoomAppProps) {
           recvChunksRef.current.push(new Uint8Array(plain));
           recvBytesRef.current += plain.byteLength;
           setRecvProgress({ got: recvBytesRef.current, total: incomingMetaRef.current.size });
+        };
+
+        // 每条消息处理完后再处理下一条，避免解密未完成就校验。
+        let receiveQueue = Promise.resolve();
+        let receiveFailed = false;
+        ch.onmessage = (ev) => {
+          receiveQueue = receiveQueue
+            .then(() => {
+              if (!receiveFailed) return handleMessage(ev);
+            })
+            .catch((error) => {
+              receiveFailed = true;
+              console.error("[recv] message processing failed:", error);
+              setStatus(t.status.dataChannelError);
+            });
         };
       };
 
